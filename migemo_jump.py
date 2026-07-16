@@ -92,22 +92,47 @@ def _build_pattern(engine, text: str) -> Optional["re.Pattern"]:
     return re.compile(re.escape(text), re.IGNORECASE)
 
 
+def _build_patterns(engine, text: str) -> List["re.Pattern"]:
+    """空白区切りの各語を migemo パターンにする（AND 検索用）。
+
+    migemo に空白入りの語をそのまま渡すと漢字展開が効かず
+    「かんり しょく」のような空白込みの literal になってしまうため、
+    語ごとに分けて query する。空／空白のみのクエリでは空リストを返す。
+    """
+    patterns = []
+    for word in text.split():
+        pattern = _build_pattern(engine, word)
+        if pattern is not None:
+            patterns.append(pattern)
+    return patterns
+
+
+def _matches_all(patterns: List["re.Pattern"], text: str) -> bool:
+    return all(p.search(text) for p in patterns)
+
+
 def match_items(items, engine, text: str) -> List:
-    """Return items whose .name matches the migemo pattern, in display order."""
-    pattern = _build_pattern(engine, text)
-    if pattern is None:
+    """Return items whose .name matches every word of the query, in display order.
+
+    空白区切りで AND 検索（"kanri shoku" は 管理 と 職 の両方を含むものだけ）。
+    語順は問わない。
+    """
+    patterns = _build_patterns(engine, text)
+    if not patterns:
         return []
-    return [it for it in items if pattern.search(getattr(it, "name", "") or "")]
+    return [it for it in items
+            if _matches_all(patterns, getattr(it, "name", "") or "")]
 
 
 def match_entries(entries: List, engine, text: str) -> List:
-    """migemoパターンで entries（.search_text 持ち）を絞り込む。空クエリは全件。"""
-    if not text:
+    """migemoパターンで entries（.search_text 持ち）を絞り込む。空クエリは全件。
+
+    空白区切りで AND 検索。語順は問わない。
+    """
+    patterns = _build_patterns(engine, text)
+    if not patterns:
         return list(entries)
-    pattern = _build_pattern(engine, text)
-    if pattern is None:
-        return list(entries)
-    return [e for e in entries if pattern.search(e.search_text)]
+    return [e for e in entries if _matches_all(patterns, e.search_text)]
 
 
 # ---------------------------------------------------------------------------
