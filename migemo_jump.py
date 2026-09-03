@@ -4,7 +4,9 @@ import ctypes
 import io
 import json
 import os
+import pathlib
 import re
+import sqlite3
 import sys
 import urllib.request
 import zipfile
@@ -348,6 +350,11 @@ def migemo_isearch(host):
 # Migemo Jump: entry model
 # ===========================================================================
 
+# 本体の履歴ファイル。History.json から History.db（SQLite）へ移行済み。
+_HISTORY_DB_NAME = "History.db"
+_HISTORY_LIMIT = 500          # 履歴から読み込む最大件数（DBは上限なく増えるため）
+_HISTORY_DB_TIMEOUT_SEC = 1.0  # 本体がロック中でもピッカー表示を待たせない
+
 _LIST_LIMIT = 10       # OSDリストに同時表示する最大行数
 _MAX_PATH_LEN = 60     # 候補行に表示するパスの最大長
 
@@ -467,12 +474,49 @@ def collect_bookmark_entries(host: "HostAPI") -> List[JumpEntry]:
     return entries
 
 
+def _load_history_db_paths(host: "HostAPI") -> Optional[List[str]]:
+    """History.db（SQLite）から最近のフォルダを新しい順に返す。
+
+    Filedini 本体が履歴を History.json から History.db へ移行したため、
+    こちらが本命の読み取り先。DB が無い / 読めない場合は None を返し、
+    呼び出し側で旧 JSON にフォールバックする。
+
+    本体が起動中でもこのファイルを掴んでいるので、必ず読み取り専用
+    （mode=ro）で開く。WAL モードのため immutable=1 は使わない
+    （書き込み中の DB に immutable を付けると古い/壊れた内容を読みうる）。
+    """
+    path = _find_config_file(_HISTORY_DB_NAME)
+    if path is None:
+        return None
+    uri = pathlib.Path(path).as_uri() + "?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=_HISTORY_DB_TIMEOUT_SEC)
+    except Exception as e:  # noqa: BLE001
+        host.log(f"jump: {_HISTORY_DB_NAME} open failed: {e}", host.LogLevel.WARNING)
+        return None
+    try:
+        rows = con.execute(
+            "SELECT Path FROM RecentDestinationFolders"
+            " ORDER BY LastUsedOrder DESC LIMIT ?",
+            (_HISTORY_LIMIT,),
+        ).fetchall()
+    except Exception as e:  # noqa: BLE001
+        host.log(f"jump: {_HISTORY_DB_NAME} query failed: {e}", host.LogLevel.WARNING)
+        return None
+    finally:
+        con.close()
+    return [r[0] for r in rows if isinstance(r[0], str) and r[0].strip()]
+
+
 def collect_history_entries(host: "HostAPI") -> List[JumpEntry]:
-    """History.json から最近のフォルダ履歴を（新しい順で）JumpEntry にして返す。"""
-    data = _load_json(host, "History.json")
-    if not data:
-        return []
-    folders = data.get("MostRecentDestinationFolders") or []
+    """最近のフォルダ履歴を（新しい順で）JumpEntry にして返す。
+
+    History.db（SQLite）を優先し、無ければ旧 History.json を読む。
+    """
+    folders = _load_history_db_paths(host)
+    if folders is None:
+        data = _load_json(host, "History.json")
+        folders = (data or {}).get("MostRecentDestinationFolders") or []
     return [
         JumpEntry("H", _tail_name(p), p, path=p)
         for p in folders
@@ -518,43 +562,56 @@ def _migemo_pick(
     on_confirm,
     title: str,
     list_limit: int = _LIST_LIMIT,
+    on_confirm_alt=None,
+    alt_label: str = "",
 ) -> None:
     """入力ダイアログとOSD候補リストを表示し、確定時に on_confirm を呼ぶ。
 
     entries: .search_text (str) と .display() -> str を持つオブジェクトの list
-    on_confirm(entry): Enter / Open / 行クリックで確定したときに呼ばれる
+    on_confirm(entry): Open ボタン / 行クリックで確定したときに呼ばれる
+    on_confirm_alt(entry): 副ボタン（alt_label）で確定したときに呼ばれる。
+        None なら副ボタンを出さない。
     """
     state = {"matches": list(entries), "index": 0, "view_map": [],
              "confirmed": False}
 
     dlg = host.ui.dialog(title)
     tb = dlg.text("ローマ字:", "", initial_focus=True)
-    dlg.label("候補は画面下部のリストに表示されます。Enter または行クリックで決定。")
+    # ホストのテキストボックスは Enter を主ボタンに転送しないため、
+    # 決定手段は行クリックかボタンのみ。文言もそれに合わせる。
+    dlg.label("候補は画面下部のリストに表示されます。行クリックで決定。")
     buttons = dlg.group(host.ui.LayoutDirection.HORIZONTAL)
     prev_btn = buttons.button("Prev")
     next_btn = buttons.button("Next")
-    open_btn = buttons.button("Open", is_primary=True)  # Enter で確定
+    open_btn = buttons.button("Open", is_primary=True)
+    alt_btn = buttons.button(alt_label) if on_confirm_alt is not None else None
     cancel_btn = buttons.button("Cancel")
 
-    def confirm(entry):
+    def confirm(entry, handler=None):
         state["confirmed"] = True
         try:
             dlg.close(host.ui.DialogResult.OK)
         except Exception as e:  # noqa: BLE001
             host.log(f"picker: dialog close failed: {e}", host.LogLevel.WARNING)
         try:
-            on_confirm(entry)
+            (handler or on_confirm)(entry)
         except Exception as e:  # noqa: BLE001
             host.log(f"picker: confirm failed: {e}", host.LogLevel.ERROR)
 
-    def on_row_click(row):
+    def _click_row(row, handler=None):
         # OSDリストのクリック（トースト側スレッドから呼ばれる）
         try:
             view_map = state.get("view_map") or []
             if 0 <= row < len(view_map) and view_map[row] is not None:
-                confirm(state["matches"][view_map[row]])
+                confirm(state["matches"][view_map[row]], handler)
         except Exception as e:  # noqa: BLE001
             host.log(f"picker: row click failed: {e}", host.LogLevel.ERROR)
+
+    def on_row_click(row):
+        _click_row(row)
+
+    def on_row_middle_click(row):
+        _click_row(row, on_confirm_alt)
 
     def update_status():
         # ホストのダイアログはコントロールのテキストを後から変更できないため、
@@ -591,8 +648,13 @@ def _migemo_pick(
                 lines.append(f"  ↓ 他 {hidden_below} 件")
                 view_map.append(None)
             state["view_map"] = view_map
-            show_list_toast(lines, selected, duration_ms=8000,
-                            on_click=on_row_click)
+            show_list_toast(
+                lines, selected, duration_ms=8000,
+                on_click=on_row_click,
+                # 副動作が無いピッカーではミドルクリックを無効にする。
+                on_middle_click=(on_row_middle_click
+                                 if on_confirm_alt is not None else None),
+            )
         except Exception as e:  # noqa: BLE001
             host.log(f"picker: list toast failed: {e}", host.LogLevel.WARNING)
 
@@ -601,6 +663,8 @@ def _migemo_pick(
             prev_btn.enabled = enabled
             next_btn.enabled = enabled
             open_btn.enabled = enabled
+            if alt_btn is not None:
+                alt_btn.enabled = enabled
         except Exception as e:  # noqa: BLE001
             host.log(f"picker: enable toggle failed: {e}")
 
@@ -624,6 +688,11 @@ def _migemo_pick(
             return
         confirm(state["matches"][state["index"]])
 
+    def on_open_alt(sender, _):
+        if not state["matches"]:
+            return
+        confirm(state["matches"][state["index"]], on_confirm_alt)
+
     def on_cancel(sender, _):
         dlg.close(host.ui.DialogResult.CANCEL)
 
@@ -631,6 +700,8 @@ def _migemo_pick(
     prev_btn.clicked += lambda s, e: goto(state["index"] - 1)
     next_btn.clicked += lambda s, e: goto(state["index"] + 1)
     open_btn.clicked += on_open
+    if alt_btn is not None:
+        alt_btn.clicked += on_open_alt
     cancel_btn.clicked += on_cancel
 
     update_status()  # 初期候補リストを表示
@@ -652,7 +723,8 @@ def _migemo_pick(
 def migemo_jump(host: "HostAPI") -> None:
     """
     Entry point: タブ / ブックマーク / 履歴の統合 migemo ジャンプ。
-    Enter / 行クリックで、タブは切り替え、それ以外は新しいタブで開く。
+    Open / 行クリックは現在のタブ、「新しいタブ」ボタンは新タブで開く。
+    すでに開いているタブはどちらでも切り替えになる。
     """
     engine = ensure_engine(host)
     if engine is None:
@@ -663,25 +735,53 @@ def migemo_jump(host: "HostAPI") -> None:
         host.ui.ok_dialog("Migemo Jump", "ジャンプ先の候補がありません。")
         return
 
-    def on_confirm(entry: JumpEntry) -> None:
-        if entry.kind == "T" and entry.tab is not None:
+    def _toast(message: str) -> None:
+        if show_toast is not None:
             try:
-                ok = host.folder_window.activate_tab(entry.tab.id)
-            except Exception as e:  # noqa: BLE001
-                host.log(f"jump: activate_tab failed: {e}", host.LogLevel.ERROR)
-                ok = False
-            if ok:
-                if show_toast is not None:
-                    try:
-                        show_toast(f"タブを切り替えました: {entry.name}")
-                    except Exception:  # noqa: BLE001
-                        pass
-                host.log(f"jump: activated tab {entry.name}")
-            else:
-                host.ui.ok_dialog(
-                    "Migemo Jump",
-                    f"タブを切り替えられませんでした: {entry.name}",
-                )
+                show_toast(message)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _switch_tab(entry: JumpEntry) -> None:
+        try:
+            ok = host.folder_window.activate_tab(entry.tab.id)
+        except Exception as e:  # noqa: BLE001
+            host.log(f"jump: activate_tab failed: {e}", host.LogLevel.ERROR)
+            ok = False
+        if ok:
+            _toast(f"タブを切り替えました: {entry.name}")
+            host.log(f"jump: activated tab {entry.name}")
+        else:
+            host.ui.ok_dialog(
+                "Migemo Jump",
+                f"タブを切り替えられませんでした: {entry.name}",
+            )
+
+    def on_confirm(entry: JumpEntry) -> None:
+        """Open / 行クリック: 現在のタブ（実行ペイン）で開く。"""
+        # すでに開いているタブは、現在ペインに開き直さず切り替える。
+        if entry.kind == "T" and entry.tab is not None:
+            _switch_tab(entry)
+            return
+
+        try:
+            ok = host.folder_window.navigate(entry.path)
+        except Exception as e:  # noqa: BLE001
+            host.log(f"jump: navigate failed: {e}", host.LogLevel.ERROR)
+            ok = False
+        if ok:
+            _toast(f"移動しました: {entry.name}")
+            host.log(f"jump: navigated [{entry.kind}] {entry.path}")
+        else:
+            host.ui.ok_dialog(
+                "Migemo Jump",
+                f"移動できませんでした:\n{entry.path}",
+            )
+
+    def on_confirm_new_tab(entry: JumpEntry) -> None:
+        """Open(新タブ): 新しいタブで開く。"""
+        if entry.kind == "T" and entry.tab is not None:
+            _switch_tab(entry)
             return
 
         try:
@@ -694,11 +794,7 @@ def migemo_jump(host: "HostAPI") -> None:
                 host.folder_window.activate_tab(tab_id)
             except Exception as e:  # noqa: BLE001
                 host.log(f"jump: activate_tab failed: {e}")
-            if show_toast is not None:
-                try:
-                    show_toast(f"開きました: {entry.name}")
-                except Exception:  # noqa: BLE001
-                    pass
+            _toast(f"開きました: {entry.name}")
             host.log(f"jump: opened [{entry.kind}] {entry.path}")
         else:
             host.ui.ok_dialog(
@@ -706,7 +802,8 @@ def migemo_jump(host: "HostAPI") -> None:
                 f"タブを開けませんでした:\n{entry.path}",
             )
 
-    _migemo_pick(host, engine, entries, on_confirm, title="Migemo Jump")
+    _migemo_pick(host, engine, entries, on_confirm, title="Migemo Jump",
+                 on_confirm_alt=on_confirm_new_tab, alt_label="新しいタブ")
 
 
 if __name__ == "__main__":
