@@ -4,6 +4,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import os
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Type checking block (editor IntelliSense only; not loaded at runtime).
@@ -198,6 +199,48 @@ def _notify(host: "HostAPI", message: str) -> None:
     host.log(f"open_in_new_tab: {message}")
 
 
+# add_tab(path) は同期的にナビゲートしない（2026-09 実測）。新タブは「その時点の
+# アクティブタブのフォルダ」で生成され、path への移動は非同期に後追いで走る。しかも
+# その移動は実行時点でアクティブなタブに着地するため、待たずに次の add_tab を呼ぶと
+# 移動が同じタブに積み上がり、履歴が [1件目, 2件目] になったタブと、移動されないまま
+# 元のフォルダに残ったタブができる。そこで1件ずつ着地を確認して直列化する。
+# 同じロジックを clipboard_tools.py / explorer_bridge.py にも複写している。
+TAB_SETTLE_TIMEOUT_SEC = 3.0
+TAB_SETTLE_POLL_SEC = 0.02
+
+
+def _same_path(left, right) -> bool:
+    """Windows のパスとして同一か（大文字小文字・区切り・末尾の区切りの揺れを無視）。"""
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+
+
+def _tab_folder(fw, tab_id: str):
+    """タブが現在表示しているフォルダ。取得できなければ None。"""
+    try:
+        pane = fw.get_pane(tab_id, 0)
+    except Exception:  # noqa: BLE001
+        return None
+    return getattr(pane, "folder_path", None) if pane else None
+
+
+def _wait_for_tab(fw, tab_id: str, path: str,
+                  timeout_sec: float = TAB_SETTLE_TIMEOUT_SEC) -> bool:
+    """
+    タブが path に到達するまで待つ。到達したら True、時間切れなら False。
+    所要時間はネットワークパスかどうかで大きく変わるため、固定の sleep ではなく
+    実際の表示フォルダを見て待つ。
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        if _same_path(_tab_folder(fw, tab_id), path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(TAB_SETTLE_POLL_SEC)
+
+
 def open_in_new_tab(host: "HostAPI") -> None:
     """
     選択中のフォルダ / ショートカット(.lnk) を新しいタブで開く。
@@ -227,6 +270,14 @@ def open_in_new_tab(host: "HostAPI") -> None:
         opened += 1
         if first_tab_id is None:
             first_tab_id = tab_id
+
+        # 次の add_tab を呼ぶ前にこのタブの移動が終わったことを確認する。待たないと
+        # 後続の移動がこのタブへ着地し、さらに set_cursor が読み込み前のフォルダに
+        # 当たって失敗する（TAB_SETTLE_* の注記参照）。
+        if not _wait_for_tab(fw, tab_id, folder):
+            host.log(f"open_in_new_tab: tab did not settle on {folder}",
+                     host.LogLevel.WARNING)
+
         if cursor_target:
             # カーソル合わせは active tab でないと効かない可能性があるため
             # 先にアクティブ化してから set_cursor する。

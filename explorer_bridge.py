@@ -125,6 +125,48 @@ def close_explorer_window(hwnd: int, tab_count: int) -> None:
         time.sleep(_CLOSE_INTERVAL_SEC)
 
 
+# add_tab(path) は同期的にナビゲートしない（2026-09 実測）。新タブは「その時点の
+# アクティブタブのフォルダ」で生成され、path への移動は非同期に後追いで走る。しかも
+# その移動は実行時点でアクティブなタブに着地するため、待たずに次の add_tab を呼ぶと
+# 移動が同じタブに積み上がり、履歴が [1件目, 2件目] になったタブと、移動されないまま
+# 元のフォルダに残ったタブができる。そこで1件ずつ着地を確認して直列化する。
+# 同じロジックを clipboard_tools.py / open_in_new_tab.py にも複写している。
+TAB_SETTLE_TIMEOUT_SEC = 3.0
+TAB_SETTLE_POLL_SEC = 0.02
+
+
+def _same_path(left, right) -> bool:
+    """Windows のパスとして同一か（大文字小文字・区切り・末尾の区切りの揺れを無視）。"""
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+
+
+def _tab_folder(fw, tab_id: str):
+    """タブが現在表示しているフォルダ。取得できなければ None。"""
+    try:
+        pane = fw.get_pane(tab_id, 0)
+    except Exception:  # noqa: BLE001
+        return None
+    return getattr(pane, "folder_path", None) if pane else None
+
+
+def _wait_for_tab(fw, tab_id: str, path: str,
+                  timeout_sec: float = TAB_SETTLE_TIMEOUT_SEC) -> bool:
+    """
+    タブが path に到達するまで待つ。到達したら True、時間切れなら False。
+    所要時間はネットワークパスかどうかで大きく変わるため、固定の sleep ではなく
+    実際の表示フォルダを見て待つ。
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        if _same_path(_tab_folder(fw, tab_id), path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(TAB_SETTLE_POLL_SEC)
+
+
 def import_explorer_folders(host: "HostAPI") -> None:
     """
     開いているエクスプローラウィンドウのフォルダを新しいタブで取り込み、
@@ -174,6 +216,14 @@ def import_explorer_folders(host: "HostAPI") -> None:
             host.log(f"explorer_bridge: add_tab failed for {path}",
                      host.LogLevel.WARNING)
             continue
+
+        # 次の add_tab を呼ぶ前にこのタブの移動が終わったことを確認する。待たないと
+        # 後続の移動がこのタブへ着地する（TAB_SETTLE_* の注記参照）。取り込み成功を
+        # 根拠にエクスプローラ窓を閉じるので、着地を見届けてから数える。
+        if not _wait_for_tab(fw, tab_id, path):
+            host.log(f"explorer_bridge: tab did not settle on {path}",
+                     host.LogLevel.WARNING)
+
         imported[hwnd] = imported.get(hwnd, 0) + 1
         if first_tab_id is None:
             first_tab_id = tab_id
