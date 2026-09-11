@@ -283,6 +283,36 @@ def ensure_engine(host):
 # ===========================================================================
 # Entry point 1: migemo_isearch（フォルダ内インクリメンタル検索）
 # ===========================================================================
+# 段階移動で目的の行からずれたときに補正する最大回数
+_STEP_MAX_ROUNDS = 3
+
+
+def _move_cursor_stepwise(host, target_path: str, paths: List[str]) -> bool:
+    """MOVE_CURSOR_UP/DOWN を繰り返してカーソルを target_path へ運ぶ。
+
+    一部のフォルダではホストの set_cursor が必ず例外を投げるため、その回避策。
+    paths は get_items の並び（".." を含む表示順）。移動後にカーソルを読み直し、
+    ずれていれば _STEP_MAX_ROUNDS 回まで補正する。到達できたら True。
+    """
+    index = {_norm(p): i for i, p in enumerate(paths)}
+    target = index.get(_norm(target_path))
+    if target is None:
+        return False
+    fw = host.folder_window
+    for _ in range(_STEP_MAX_ROUNDS):
+        current = index.get(_norm(host.state.get_cursor_path() or ""))
+        if current is None:
+            return False
+        delta = target - current
+        if delta == 0:
+            return True
+        operation = (fw.Operation.MOVE_CURSOR_DOWN if delta > 0
+                     else fw.Operation.MOVE_CURSOR_UP)
+        for _ in range(abs(delta)):
+            fw.execute_operation(operation)
+    return _norm(host.state.get_cursor_path() or "") == _norm(target_path)
+
+
 def migemo_isearch(host):
     """Entry point: incremental migemo search over the current folder.
 
@@ -295,12 +325,14 @@ def migemo_isearch(host):
 
     result = host.folder_window.get_items(limit=0)
     items = list(result.items) if result else []
+    # 段階移動の行数計算には ".." を含む表示どおりの並びが要る
+    listing_paths = [getattr(it, "path", "") or "" for it in items]
     items = [it for it in items if it.name != ".." and getattr(it, "name", None) is not None]
     if not items:
         host.ui.ok_dialog("Migemo Search", "現在のフォルダに項目がありません。")
         return
 
-    state = {"matches": [], "index": 0}
+    state = {"matches": [], "index": 0, "set_cursor_broken": False}
 
     dlg = host.ui.dialog("Migemo Search")
     tb = dlg.text("ローマ字:", "", initial_focus=True)
@@ -321,10 +353,23 @@ def migemo_isearch(host):
         if not state["matches"]:
             return
         state["index"] = idx % len(state["matches"])
+        target = state["matches"][state["index"]].path
+        if not state["set_cursor_broken"]:
+            try:
+                host.folder_window.set_cursor(target)
+                return
+            except Exception as e:  # noqa: BLE001
+                # 失敗するフォルダでは毎回失敗するので、このダイアログの間は
+                # set_cursor を諦めて段階移動に切り替える。
+                state["set_cursor_broken"] = True
+                host.log(f"migemo: set_cursor failed, using stepwise move: {e}",
+                         host.LogLevel.WARNING)
         try:
-            host.folder_window.set_cursor(state["matches"][state["index"]].path)
+            if not _move_cursor_stepwise(host, target, listing_paths):
+                host.log(f"migemo: stepwise move could not reach {target}",
+                         host.LogLevel.WARNING)
         except Exception as e:  # noqa: BLE001
-            host.log(f"migemo: set_cursor failed: {e}")
+            host.log(f"migemo: stepwise move failed: {e}", host.LogLevel.ERROR)
 
     def on_changed(sender, value):
         try:
