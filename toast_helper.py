@@ -47,6 +47,7 @@ WM_DESTROY = 0x0002
 WM_TIMER = 0x0113
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONUP = 0x0202
+WM_MBUTTONUP = 0x0208
 
 DT_CENTER = 0x0001
 DT_VCENTER = 0x0004
@@ -177,7 +178,8 @@ _active_hwnd: Optional[int] = None
 class _ToastState:
     def __init__(self, message: str, font, brush,
                  lines=None, selected=-1, hilite_brush=None, row_height=0,
-                 on_click=None, hover_brush=None, duration_ms=1500):
+                 on_click=None, hover_brush=None, duration_ms=1500,
+                 on_middle_click=None):
         self.message = message
         self.font = font
         self.brush = brush
@@ -189,6 +191,7 @@ class _ToastState:
         self.row_height = row_height
         # クリック対応リスト用
         self.on_click = on_click
+        self.on_middle_click = on_middle_click
         self.hover_brush = hover_brush
         self.hover = -1
         self.duration_ms = duration_ms
@@ -259,7 +262,7 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
             _user32.EndPaint(hwnd, ctypes.byref(ps))
         return 0
 
-    if (msg in (WM_MOUSEMOVE, WM_LBUTTONUP) and state is not None
+    if (msg in (WM_MOUSEMOVE, WM_LBUTTONUP, WM_MBUTTONUP) and state is not None
             and state.lines is not None and state.on_click is not None
             and state.row_height > 0):
         y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
@@ -280,9 +283,16 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
             _user32.SetTimer(hwnd, TIMER_LIFE, state.duration_ms, None)
             return 0
 
-        # WM_LBUTTONUP: クリックされた行をコールバックへ
+        # クリックされた行をコールバックへ。
+        # ミドルクリックは on_middle_click 未指定なら無視する（左と同じ動作に
+        # フォールバックさせない。誤クリックで意図しない確定をしないため）。
         if in_range:
-            callback = state.on_click
+            if msg == WM_MBUTTONUP:
+                callback = state.on_middle_click
+            else:
+                callback = state.on_click
+            if callback is None:
+                return 0
             _user32.DestroyWindow(hwnd)
             try:
                 callback(row)
@@ -359,7 +369,8 @@ def _apply_rounded_corners(hwnd) -> None:
 
 
 def _toast_thread(message: str, duration_ms: int,
-                  lines=None, selected=-1, on_click=None) -> None:
+                  lines=None, selected=-1, on_click=None,
+                  on_middle_click=None) -> None:
     global _active_hwnd
 
     _ensure_class()
@@ -420,6 +431,7 @@ def _toast_thread(message: str, duration_ms: int,
         lines=lines, selected=selected,
         hilite_brush=hilite_brush, row_height=row_height,
         on_click=on_click, hover_brush=hover_brush, duration_ms=duration_ms,
+        on_middle_click=on_middle_click,
     )
     _instances[hwnd_key] = state
 
@@ -465,7 +477,7 @@ def show_toast(message: str, duration_ms: int = 1500) -> threading.Thread:
 
 def show_list_toast(
     lines: list[str], selected: int = -1, duration_ms: int = 4000,
-    on_click=None,
+    on_click=None, on_middle_click=None,
 ) -> threading.Thread:
     """
     複数行のリストをOSD表示する。selected 行はハイライトされる。
@@ -476,10 +488,14 @@ def show_list_toast(
     - 行のホバーでグレーハイライト、クリックで on_click(row_index) を呼ぶ
     - マウスがリスト上にある間は自動消滅しない
     - コールバックはトーストのUIスレッドから呼ばれる点に注意
+
+    on_middle_click を渡すと、ミドルクリックでそちらが呼ばれる（別動作にできる）。
+    未指定ならミドルクリックは無視される（左クリックにフォールバックしない）。
     """
     thread = threading.Thread(
         target=_toast_thread,
-        args=("", duration_ms, list(lines), selected, on_click),
+        args=("", duration_ms, list(lines), selected, on_click,
+              on_middle_click),
         daemon=True,
     )
     thread.start()
